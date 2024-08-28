@@ -154,7 +154,7 @@ def sgp4_propagate_tle_batch_forward(simulation_start_epoch, simulation_end_epoc
 
     return sgp4_cartesian_states, sgp4_epochs
 
-def setup_arcs(arc_length, sgp4_cartesian_states, sgp4_epochs):
+def setup_arcs(arc_length, sgp4_states, sgp4_epochs, time_step):
 
     """
     Start epoch is the first epochs of an arc.
@@ -163,7 +163,7 @@ def setup_arcs(arc_length, sgp4_cartesian_states, sgp4_epochs):
     """
     
     arcs_start_epochs = [sgp4_epochs[0]]
-    arcs_initial_states = [sgp4_cartesian_states[0]]
+    arcs_initial_states = [sgp4_states[0]]
     arcs_termination_epochs = []
     arcs_lengths = []
 
@@ -172,7 +172,7 @@ def setup_arcs(arc_length, sgp4_cartesian_states, sgp4_epochs):
         if sgp4_epochs[i] >= arc_epoch:
             
             arcs_start_epochs.append(sgp4_epochs[i])
-            arcs_initial_states.append(sgp4_cartesian_states[i])
+            arcs_initial_states.append(sgp4_states[i])
             arcs_termination_epochs.append(sgp4_epochs[i])
             arc_epoch += arc_length
     
@@ -188,7 +188,41 @@ def setup_arcs(arc_length, sgp4_cartesian_states, sgp4_epochs):
     arcs_initial_states = np.array(arcs_initial_states)
     arcs_lengths = arcs_termination_epochs - arcs_start_epochs
 
-    return arcs_start_epochs, arcs_termination_epochs, arcs_initial_states, arcs_lengths
+    # Split epochs into arcs
+    arcs_epochs = [np.arange(arcs_start_epochs[i], arcs_termination_epochs[i], time_step) for i, _ in enumerate(arcs_lengths)]
+
+    # Split states into arcs
+    arcs_sgp4_states = []
+    index = 0
+    for sublist in arcs_epochs:
+        length = len(sublist)
+        arcs_sgp4_states.append(sgp4_states[index:index + length])
+        index += length
+
+    return arcs_start_epochs, arcs_termination_epochs, arcs_initial_states, arcs_lengths, arcs_epochs, arcs_sgp4_states
+
+def setup_prediction_arcs(sgp4_epochs, sgp4_states, drag_arcs_termination_epochs, prediction_arc_length, time_step):
+    
+    # Get initial epochs
+    pred_arcs_epochs_0 = [np.arange(drag_arcs_termination_epochs[i], drag_arcs_termination_epochs[i] + prediction_arc_length, time_step) for i, _ in enumerate(drag_arcs_termination_epochs)]
+
+    # Remove epochs from outside SGP4 epochs
+    pred_arcs_epochs = []
+    for i, arc_epochs in enumerate(pred_arcs_epochs_0):
+        if arc_epochs[-1] < sgp4_epochs[-1]:
+            pred_arcs_epochs.append(arc_epochs)
+    pred_arcs_epochs = np.array(pred_arcs_epochs)
+
+    # Get SGP4 states
+    pred_arcs_sgp4_states = np.array([sgp4_states[(sgp4_epochs >= arc_epochs[0]) & (sgp4_epochs <= arc_epochs[-1])] for arc_epochs in pred_arcs_epochs])
+
+    # Get arcs termination epochs
+    pred_arcs_termination_epochs = pred_arcs_epochs[:, -1] + time_step
+    
+    # Get arcs length
+    pred_arcs_lengths = pred_arcs_termination_epochs - pred_arcs_epochs[:, 0]
+
+    return pred_arcs_epochs, pred_arcs_sgp4_states, pred_arcs_termination_epochs, pred_arcs_lengths
 
 def setup_arcs_multiarc_prediction(estimation_arc_length, prediction_arc_length, drag_arc_length, sgp4_cartesian_states, sgp4_epochs, sgp4_time_step):
 
@@ -340,9 +374,7 @@ def setup_environment_multiarc(sgp4_cartesian_states, epochs, drag_coefficient, 
         radiation_pressure_settings
     )
 
-    model = body_settings.get( "Earth" ).atmosphere_settings
-
-    return bodies,model
+    return bodies
 
 
 def setup_propagation(bodies, initial_state, simulation_start_epoch, simulation_end_epoch, time_step, earth_harmonics):
@@ -387,6 +419,7 @@ def setup_propagation(bodies, initial_state, simulation_start_epoch, simulation_
         central_bodies)
 
     # Define list of dependent variables to save
+    spherical_harmonic_terms = [(0, 0), (2, 0), (2, 1), (2, 2), (3, 0), (3, 1), (3, 2), (3, 3), (4, 0), (4, 1), (4, 2), (4, 3), (4, 4)]
     dependent_variables = [
         propagation_setup.dependent_variable.total_acceleration_norm("Delfi-PQ"),
         propagation_setup.dependent_variable.single_acceleration_norm(propagation_setup.acceleration.point_mass_gravity_type, "Delfi-PQ", "Sun"),
@@ -398,7 +431,8 @@ def setup_propagation(bodies, initial_state, simulation_start_epoch, simulation_
         propagation_setup.dependent_variable.single_acceleration_norm(propagation_setup.acceleration.aerodynamic_type, "Delfi-PQ", "Earth"),
         propagation_setup.dependent_variable.single_acceleration_norm(propagation_setup.acceleration.cannonball_radiation_pressure_type, "Delfi-PQ", "Sun"),
         propagation_setup.dependent_variable.latitude("Delfi-PQ", "Earth"),
-        propagation_setup.dependent_variable.longitude("Delfi-PQ", "Earth")
+        propagation_setup.dependent_variable.longitude("Delfi-PQ", "Earth"),
+        propagation_setup.dependent_variable.spherical_harmonic_terms_acceleration_norm("Delfi-PQ", "Earth", spherical_harmonic_terms)
     ]
 
     # Create numerical integrator settings
@@ -564,7 +598,7 @@ def perform_estimation(estimatable_parameters, estimator, observation_collection
 
     # Set methodological options
     estimation_input.define_estimation_settings(
-        reintegrate_variational_equations=True,  # ?
+        reintegrate_variational_equations=True,
         save_state_history_per_iteration=True)
 
     # Perform the estimation
@@ -580,12 +614,8 @@ def preform_covariance_analysis(estimator, observation_collection):
 
     # Set methodological options
     covariance_input.define_covariance_settings(
-        reintegrate_variational_equations=False,  # ?
+        reintegrate_variational_equations=False,
         print_output_to_terminal=True)
-
-    # # Define weighting of the observations in the inversion
-    # weights_per_observable = {estimation_setup.observation.one_way_instantaneous_doppler_type: noise_level ** -2}
-    # covariance_input.set_constant_weight_per_observable(weights_per_observable)
 
     # Perform the covariance analysis
     covariance_output = estimator.compute_covariance(covariance_input)
@@ -748,7 +778,7 @@ def plot_residuals_estimation(tnw_final_residuals, observation_epochs, tles_batc
             else:
                 plt.axvline(x=tle_epoch, color="yellow")
 
-    plt.ylabel("Final residuals [km]")
+    plt.ylabel("Residuals [km]")
     plt.xlabel("Epochs [days]")
     plt.grid()
     plt.legend(loc='upper right', bbox_to_anchor=(1, 1))
@@ -760,39 +790,144 @@ def plot_residuals_estimation(tnw_final_residuals, observation_epochs, tles_batc
     Residuals are defined as true_position - estimated_position
     """
 
+def plot_residuals_multiarc_estimation(tnw_final_residuals, observation_epochs, tles_batch_epochs, show_tles_epochs):
+
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(9, 6), dpi=100)
+
+    if show_tles_epochs:
+        for i, tle_epoch in enumerate((tles_batch_epochs - observation_epochs[0])/3600/24):
+            if i == 1:
+                ax1.axvline(x=tle_epoch, color="yellow", label="TLE epochs", linewidth=0.75)
+            else:
+                ax1.axvline(x=tle_epoch, color="yellow", linewidth=0.75)
+    ax1.scatter((observation_epochs - observation_epochs[0])/3600/24, tnw_final_residuals[:, 0]/1000, color="blue", marker='.', s=20)
+    ax1.set_xticks(range(0, 11, 1))
+    ax1.set_yticks(range(-4, 5, 2))
+    ax1.tick_params(axis='both', which='major', labelsize=15)
+    ax1.set_ylabel("t-residuals [km]", fontsize=15)
+    ax1.set_xlim(0, 10)
+    ax1.set_ylim(-4, 4)
+    ax1.grid()
+
+    if show_tles_epochs:
+        for i, tle_epoch in enumerate((tles_batch_epochs - observation_epochs[0])/3600/24):
+            if i == 1:
+                ax2.axvline(x=tle_epoch, color="yellow", label="TLE epoch", linewidth=0.75)
+            else:
+                ax2.axvline(x=tle_epoch, color="yellow", linewidth=0.75)
+    ax2.scatter((observation_epochs - observation_epochs[1])/3600/24, tnw_final_residuals[:, 1]/1000, color="green", marker='.', label="n-residual", s=20)
+    ax2.set_xticks(range(0, 11, 1))
+    ax2.set_yticks(range(-4, 5, 2))
+    ax2.tick_params(axis='both', which='major', labelsize=15)
+    ax2.set_ylabel("n-residuals [km]", fontsize=15)
+    ax2.set_xlim(0, 10)
+    ax2.set_ylim(-4, 4)
+    ax2.grid()
+
+    if show_tles_epochs:
+        for i, tle_epoch in enumerate((tles_batch_epochs - observation_epochs[0])/3600/24):
+            if i == 1:
+                ax3.axvline(x=tle_epoch, color="yellow", label="TLE epochs", linewidth=0.75)
+            else:
+                ax3.axvline(x=tle_epoch, color="yellow", linewidth=0.75)
+    ax3.scatter((observation_epochs - observation_epochs[2])/3600/24, tnw_final_residuals[:, 2]/1000, color="red", marker='.', s=20)
+    ax3.set_xticks(range(0, 11, 1))
+    ax3.set_yticks(range(-4, 5, 2))
+    ax3.tick_params(axis='both', which='major', labelsize=15)
+    ax3.set_ylabel("w-residuals [km]", fontsize=15)
+    ax3.set_xlabel("Epochs [days]", fontsize=15)
+    ax3.set_xlim(0, 10)
+    ax3.set_ylim(-4, 4)
+    ax3.legend(loc='upper left', fontsize=15)
+    ax3.grid()
+
+    plt.tight_layout()
+    plt.show()
+
 def plot_residuals_singlearc_prediction(tnw_final_residuals, tnw_final_residuals_conventional, conventional_epochs, observation_epochs, tles_batch_epochs, prediction_start_epoch, show_tles_epochs):
 
-    plt.figure(figsize=(13,3), dpi=100)
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(9, 6), dpi=100)
 
-    plt.scatter((observation_epochs - prediction_start_epoch)/3600, tnw_final_residuals[:, 0]/1000, color="blue", marker='.', label="t-residual")
-    plt.scatter((observation_epochs - prediction_start_epoch)/3600, tnw_final_residuals[:, 1]/1000, color="green", marker='.', label="n-residual")
-    plt.scatter((observation_epochs - prediction_start_epoch)/3600, tnw_final_residuals[:, 2]/1000, color="red", marker='.', label="w-residual")
-    plt.scatter((conventional_epochs - prediction_start_epoch)/3600, tnw_final_residuals_conventional[:, 0]/1000, color="black", marker='.', label="t-residual conv")
-    plt.scatter((conventional_epochs - prediction_start_epoch)/3600, tnw_final_residuals_conventional[:, 1]/1000, color="#808080", marker='.', label="n-residual conv")
-    plt.scatter((conventional_epochs - prediction_start_epoch)/3600, tnw_final_residuals_conventional[:, 2]/1000, color="#A9A9A9", marker='.', label="w-residual conv")
-    
     if show_tles_epochs:
-        for i, tle_epoch in enumerate((tles_batch_epochs - prediction_start_epoch)/3600):
+        for i, tle_epoch in enumerate((tles_batch_epochs - prediction_start_epoch)/3600/24):
             if i == 1:
-                plt.axvline(x=tle_epoch, color="yellow", label="TLE epoch")
+                ax1.axvline(x=tle_epoch, color="yellow", label="TLE epochs", linewidth=0.75)
             else:
-                plt.axvline(x=tle_epoch, color="yellow")
+                ax1.axvline(x=tle_epoch, color="yellow", linewidth=0.75)  
+    ax1.scatter((observation_epochs - prediction_start_epoch)/3600/24, tnw_final_residuals[:, 0]/1000, color="blue", marker='.', label="Model Prediction", s=20)
+    ax1.scatter((conventional_epochs - prediction_start_epoch)/3600/24, tnw_final_residuals_conventional[:, 0]/1000, color="black", marker='.', label="SGP4 Prediction", s=20)
+    ax1.set_xticks(range(-2, 5))
+    ax1.set_yticks(range(-30, 11, 10))
+    ax1.tick_params(axis='both', which='major', labelsize=15)
+    ax1.set_xlim(-2, 4)
+    ax1.set_ylim(-35, 10)
+    ax1.set_ylabel("t-residuals [km]", fontsize=15)
+    ax1.grid()
+    ax1.legend(fontsize=10)
 
-    plt.ylabel("Final residuals [km]")
-    plt.xlabel("Epochs [hr]")
-    plt.grid()
-    plt.legend(loc='lower left', bbox_to_anchor=(0, 0))
+    if show_tles_epochs:
+        for i, tle_epoch in enumerate((tles_batch_epochs - prediction_start_epoch)/3600/24):
+            if i == 1:
+                ax2.axvline(x=tle_epoch, color="yellow", label="TLE epochs", linewidth=0.75)
+            else:
+                ax2.axvline(x=tle_epoch, color="yellow", linewidth=0.75)  
+    ax2.scatter((observation_epochs - prediction_start_epoch)/3600/24, tnw_final_residuals[:, 1]/1000, color="green", marker='.', label="Model Prediction", s=20)
+    ax2.scatter((conventional_epochs - prediction_start_epoch)/3600/24, tnw_final_residuals_conventional[:, 1]/1000, color="#808080", marker='.', label="SGP4 Prediction", s=20)
+    ax2.set_xticks(range(-2, 5))
+    ax2.set_yticks(np.arange(-1, 1.5, 0.5))
+    ax2.tick_params(axis='both', which='major', labelsize=15)
+    ax2.set_xlim(-2, 4)
+    ax2.set_ylim(-1, 1)
+    ax2.set_ylabel("n-residuals [km]", fontsize=15)
+    ax2.grid()
+    ax2.legend(fontsize=10)
+
+    if show_tles_epochs:
+        for i, tle_epoch in enumerate((tles_batch_epochs - prediction_start_epoch)/3600/24):
+            if i == 1:
+                ax3.axvline(x=tle_epoch, color="yellow", label="TLE epochs", linewidth=0.75)
+            else:
+                ax3.axvline(x=tle_epoch, color="yellow", linewidth=0.75)  
+    ax3.scatter((observation_epochs - prediction_start_epoch)/3600/24, tnw_final_residuals[:, 2]/1000, color="red", marker='.', label="Model Prediction", s=20)
+    ax3.scatter((conventional_epochs - prediction_start_epoch)/3600/24, tnw_final_residuals_conventional[:, 2]/1000, color="#A9A9A9", marker='.', label="SGP4 Prediction", s=20)
+    ax3.set_xticks(range(-2, 5))
+    ax3.set_yticks(np.arange(-1, 1.5, 0.5))
+    ax3.tick_params(axis='both', which='major', labelsize=15)
+    ax3.set_xlim(-2, 4)
+    ax3.set_ylim(-1, 1)
+    ax3.set_ylabel("w-residuals [km]", fontsize=15)
+    ax3.set_xlabel("Epochs [day]", fontsize=15)
+    ax3.grid()
+    ax3.legend(fontsize=10)
+    
     plt.tight_layout()
     plt.show()
 
 def plot_histogram(tnw_final_residuals):
 
-    plt.hist(tnw_final_residuals[:, 0]/1000, 60)
-    plt.xlabel('Final residuals in t-direction [km]')
-    plt.ylabel('Occurrences [-]')
-    plt.grid()
-    plt.show()
+    # Define bins
+    min_edge = np.min(tnw_final_residuals) / 1000
+    max_edge = np.max(tnw_final_residuals) / 1000
+    bin_width = 0.05
+    bins = np.arange(min_edge, max_edge + bin_width, bin_width)
 
+    # Create figure
+    plt.figure(figsize=(9, 6), dpi=100)
+    plt.hist(tnw_final_residuals[:, 0]/1000, bins=bins, color="blue", alpha=0.5, label="t-residuals")
+    plt.hist(tnw_final_residuals[:, 2]/1000, bins=bins, color="red", alpha=0.5, label="w-residuals")
+    plt.hist(tnw_final_residuals[:, 1]/1000, bins=bins, color="green", alpha=0.5, label="n-residuals")
+    
+    # Set figure
+    plt.xlabel('Residuals [km]', fontsize=15)
+    plt.ylabel('Occurrences [-]', fontsize=15)
+    plt.xticks(fontsize=15)
+    plt.yticks(fontsize=15)
+    plt.xlim(-3, 3)
+    plt.ylim(0, 1600)
+    plt.legend(fontsize=15)
+    plt.tight_layout()
+    plt.grid()
+    plt.show()    
 
 def plot_3D_cartesian_states(epochs, cartesian_states):
 
@@ -894,6 +1029,12 @@ def plot_accelerations(dependent_variables, propagation_epochs):
     acceleration_norm_rp_sun = dependent_variables[:,8]
     plt.plot((propagation_epochs - propagation_epochs[0])/3600/24, acceleration_norm_rp_sun, label='Radiation Pressure Sun')
 
+    # spherical_harmonic_terms = [(0, 0,) (), (2, 0), (2, 1), (2, 2), (3, 0), (3, 1), (3, 2), (3, 3)]
+    spherical_harmonic_terms = [(0, 0), (2, 0), (2, 1), (2, 2), (3, 0), (3, 1), (3, 2), (3, 3), (4, 0), (4, 1), (4, 2), (4, 3), (4, 4)]
+    for i, eh in enumerate(spherical_harmonic_terms):
+        acceleration_norm = dependent_variables[:,11+i]
+        plt.plot((propagation_epochs - propagation_epochs[0])/3600/24, acceleration_norm, label=f'C_{eh[0]},{eh[1]}', linestyle="dotted")
+
     # plt.xlim([min(propagation_epochs/3600), max(propagation_epochs)])
     plt.xlabel('Time [days]')
     plt.ylabel('Acceleration Norm [m/s$^2$]')
@@ -907,14 +1048,19 @@ def plot_accelerations(dependent_variables, propagation_epochs):
     plt.show()
 
 def plot_correlation_matrix(covariance_output):
-    plt.figure(figsize=(8, 7))
-
+    
+    # Create figure
+    plt.figure(figsize=(9, 7))
     plt.imshow(np.abs(covariance_output.correlations), aspect='equal', interpolation='none')
-    plt.colorbar()
-
-    plt.xlabel("Estimated Parameter Index")
-    plt.ylabel("Estimated Parameter Index")
-
+    
+    # Set figure
+    cbar = plt.colorbar()
+    cbar.set_ticks(np.arange(0.0, 1.1, 0.1))
+    cbar.ax.tick_params(labelsize=15)
+    plt.xlabel("Estimated Parameter Index", fontsize=15)
+    plt.ylabel("Estimated Parameter Index", fontsize=15)
+    plt.xticks(fontsize=15)
+    plt.yticks(fontsize=15)
     plt.tight_layout()
     plt.show()
 
